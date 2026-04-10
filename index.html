@@ -27,7 +27,12 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script>
-    if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
+    if('serviceWorker' in navigator){
+      navigator.serviceWorker.getRegistrations().then(function(regs){
+        regs.forEach(function(r){r.unregister();});
+      });
+      navigator.serviceWorker.register('/sw.js').catch(function(){});
+    }
   </script>
   <script type="text/babel">
 const { useState, useEffect, useRef } = React;
@@ -72,27 +77,41 @@ function loadFirebase() {
   });
 }
 
-// ─── Photo Compression ───
+// ─── Photo Compression (aggressive — max 100KB per photo) ───
 function compressImage(dataUrl, maxW, quality) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const c = document.createElement("canvas");
       const ratio = Math.min(maxW / img.width, maxW / img.height, 1);
-      c.width = img.width * ratio;
-      c.height = img.height * ratio;
+      c.width = Math.round(img.width * ratio);
+      c.height = Math.round(img.height * ratio);
       const ctx = c.getContext("2d");
       ctx.drawImage(img, 0, 0, c.width, c.height);
-      resolve(c.toDataURL("image/jpeg", quality));
+      let result = c.toDataURL("image/jpeg", quality);
+      // If still too big, compress more
+      if (result.length > 150000) {
+        c.width = Math.round(c.width * 0.6);
+        c.height = Math.round(c.height * 0.6);
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        result = c.toDataURL("image/jpeg", 0.4);
+      }
+      resolve(result);
     };
     img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
   });
 }
 
-// ─── Local Storage Backup ───
-function localSave(key, val) { try { localStorage.setItem("citas_" + key, JSON.stringify(val)); } catch(e) {} }
-function localLoad(key) { try { const v = localStorage.getItem("citas_" + key); return v ? JSON.parse(v) : null; } catch { return null; } }
+// ─── Local Storage ───
+function localSave(key, val) {
+  try { localStorage.setItem("citas_" + key, JSON.stringify(val)); }
+  catch(e) { console.error("localStorage save error:", key, e); }
+}
+function localLoad(key) {
+  try { const v = localStorage.getItem("citas_" + key); return v ? JSON.parse(v) : null; }
+  catch { return null; }
+}
 
 // ─── Firebase Paths (split data & photos to stay under 1MB) ───
 const DOC_DATA = "parejas/juan-luisa-data";
@@ -425,9 +444,20 @@ function App(){
     const f=e.target.files?.[0];if(!f||!uid)return;
     const reader=new FileReader();
     reader.onload=async(ev)=>{
-      const compressed=await compressImage(ev.target.result,800,0.6);
-      const np={...photos,[uid]:compressed};
-      setPhotos(np);syncPhotos(np);setUid(null);
+      const currentUid=uid;
+      // Save immediately
+      const np={...photos,[currentUid]:ev.target.result};
+      setPhotos(np);
+      localSave("photos",np);
+      setUid(null);
+      // Then compress and sync
+      try {
+        const compressed=await compressImage(ev.target.result,600,0.5);
+        const npComp={...photos,[currentUid]:compressed};
+        setPhotos(npComp);
+        localSave("photos",npComp);
+        syncPhotos(npComp);
+      } catch(err) { syncPhotos(np); }
     };
     reader.readAsDataURL(f);e.target.value="";
   }
@@ -436,10 +466,16 @@ function App(){
     localSave("setupDone",true);
     setShowSetup(false);
     if(ph){
-      const compressed=await compressImage(ph,400,0.5);
-      setProfPhoto(compressed);
-      localSave("profPhoto",compressed);
-      syncProfile(compressed);
+      // Save original immediately so it persists
+      setProfPhoto(ph);
+      localSave("profPhoto",ph);
+      // Then compress and sync to Firebase in background
+      try {
+        const compressed=await compressImage(ph,300,0.4);
+        setProfPhoto(compressed);
+        localSave("profPhoto",compressed);
+        syncProfile(compressed);
+      } catch(e) { syncProfile(ph); }
     }
   }
   async function handleProfChange(e){
