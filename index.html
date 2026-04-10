@@ -89,12 +89,11 @@ function compressImage(dataUrl, maxW, quality) {
       const ctx = c.getContext("2d");
       ctx.drawImage(img, 0, 0, c.width, c.height);
       let result = c.toDataURL("image/jpeg", quality);
-      // If still too big, compress more
       if (result.length > 150000) {
-        c.width = Math.round(c.width * 0.6);
-        c.height = Math.round(c.height * 0.6);
+        c.width = Math.round(c.width * 0.5);
+        c.height = Math.round(c.height * 0.5);
         ctx.drawImage(img, 0, 0, c.width, c.height);
-        result = c.toDataURL("image/jpeg", 0.4);
+        result = c.toDataURL("image/jpeg", 0.3);
       }
       resolve(result);
     };
@@ -103,15 +102,37 @@ function compressImage(dataUrl, maxW, quality) {
   });
 }
 
-// ─── Local Storage ───
-function localSave(key, val) {
-  try { localStorage.setItem("citas_" + key, JSON.stringify(val)); }
-  catch(e) { console.error("localStorage save error:", key, e); }
+// ─── IndexedDB for persistent photo storage (survives iOS PWA restarts) ───
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("citas100db", 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore("data"); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
 }
-function localLoad(key) {
-  try { const v = localStorage.getItem("citas_" + key); return v ? JSON.parse(v) : null; }
-  catch { return null; }
+
+async function idbSave(key, val) {
+  try {
+    const db = await openIDB();
+    const tx = db.transaction("data", "readwrite");
+    tx.objectStore("data").put(val, key);
+    await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+  } catch(e) { console.error("IDB save error:", key, e); }
 }
+
+async function idbLoad(key) {
+  try {
+    const db = await openIDB();
+    const tx = db.transaction("data", "readonly");
+    const req = tx.objectStore("data").get(key);
+    return new Promise((res) => { req.onsuccess = () => res(req.result || null); req.onerror = () => res(null); });
+  } catch { return null; }
+}
+
+// Small flags still use localStorage
+function flagSave(key, val) { try { localStorage.setItem("c_" + key, JSON.stringify(val)); } catch {} }
+function flagLoad(key) { try { const v = localStorage.getItem("c_" + key); return v ? JSON.parse(v) : null; } catch { return null; } }
 
 // ─── Firebase Paths (split data & photos to stay under 1MB) ───
 const DOC_DATA = "parejas/juan-luisa-data";
@@ -374,56 +395,59 @@ function App(){
 
   // Load initial data & start real-time listener
   useEffect(()=>{
-    // Load local backup first (instant)
-    const lc = localLoad("comp"); if(lc) setComp(lc);
-    const lp = localLoad("photos"); if(lp) setPhotos(lp);
-    const lpp = localLoad("profPhoto"); if(lpp) setProfPhoto(lpp);
-    const lsw = localLoad("swaps"); if(lsw) setSwaps(lsw);
-    const setupDone = localLoad("setupDone");
-    if(!lpp && !setupDone) setShowSetup(true);
-    setLoading(false);
+    async function init() {
+      // Load from IndexedDB first (persistent on iOS)
+      const lc = await idbLoad("comp"); if(lc) setComp(lc);
+      const lp = await idbLoad("photos"); if(lp) setPhotos(lp);
+      const lpp = await idbLoad("profPhoto"); if(lpp) setProfPhoto(lpp);
+      const lsw = await idbLoad("swaps"); if(lsw) setSwaps(lsw);
+      const setupDone = flagLoad("setupDone");
+      if(!lpp && !setupDone) setShowSetup(true);
+      setLoading(false);
 
-    // Then start Firebase real-time sync
-    fbListenData((type, data)=>{
-      if(skipSync.current){skipSync.current=false;return;}
-      if(type==="data"){
-        if(data.c){setComp(data.c);localSave("comp",data.c);}
-        if(data.sw){setSwaps(data.sw);localSave("swaps",data.sw);}
-        setSynced(true);
-      }
-      if(type==="profile"){
-        if(data.pp){
-          setProfPhoto(data.pp);
-          localSave("profPhoto",data.pp);
-          localSave("setupDone",true);
-          setShowSetup(false);
+      // Then start Firebase real-time sync
+      fbListenData((type, data)=>{
+        if(skipSync.current){skipSync.current=false;return;}
+        if(type==="data"){
+          if(data.c){setComp(data.c);idbSave("comp",data.c);}
+          if(data.sw){setSwaps(data.sw);idbSave("swaps",data.sw);}
+          setSynced(true);
         }
-      }
-    });
+        if(type==="profile"){
+          if(data.pp){
+            setProfPhoto(data.pp);
+            idbSave("profPhoto",data.pp);
+            flagSave("setupDone",true);
+            setShowSetup(false);
+          }
+        }
+      });
 
-    // Load photos from Firebase chunks
-    fbLoadPhotos().then(p=>{
-      if(p && Object.keys(p).length>0){setPhotos(p);localSave("photos",p);}
-    });
+      // Load photos from Firebase chunks
+      fbLoadPhotos().then(p=>{
+        if(p && Object.keys(p).length>0){setPhotos(p);idbSave("photos",p);}
+      });
+    }
+    init();
   },[]);
 
   async function syncData(newComp,newSwaps){
     skipSync.current=true;
     const c=newComp||comp;
     const sw=newSwaps||swaps;
-    localSave("comp",c);
-    localSave("swaps",sw);
+    idbSave("comp",c);
+    idbSave("swaps",sw);
     fbSaveData({c,sw});
   }
 
   async function syncPhotos(newPhotos){
     const p=newPhotos||photos;
-    localSave("photos",p);
+    idbSave("photos",p);
     fbSavePhotos(p);
   }
 
   async function syncProfile(newPP){
-    localSave("profPhoto",newPP);
+    idbSave("profPhoto",newPP);
     fbSaveProfile(newPP);
   }
 
@@ -445,35 +469,34 @@ function App(){
     const reader=new FileReader();
     reader.onload=async(ev)=>{
       const currentUid=uid;
-      // Save immediately
-      const np={...photos,[currentUid]:ev.target.result};
-      setPhotos(np);
-      localSave("photos",np);
       setUid(null);
-      // Then compress and sync
+      setProfPhoto(p=>p); // keep current
       try {
         const compressed=await compressImage(ev.target.result,600,0.5);
-        const npComp={...photos,[currentUid]:compressed};
-        setPhotos(npComp);
-        localSave("photos",npComp);
-        syncPhotos(npComp);
-      } catch(err) { syncPhotos(np); }
+        const np={...photos,[currentUid]:compressed};
+        setPhotos(np);
+        idbSave("photos",np);
+        syncPhotos(np);
+      } catch(err) {
+        const np={...photos,[currentUid]:ev.target.result};
+        setPhotos(np);
+        idbSave("photos",np);
+        syncPhotos(np);
+      }
     };
     reader.readAsDataURL(f);e.target.value="";
   }
   function handleSwap(id,nd){const ns={...swaps,[id]:nd};setSwaps(ns);setSwapTarget(null);setExp(null);syncData(null,ns);}
   async function handleProfileDone(ph){
-    localSave("setupDone",true);
+    flagSave("setupDone",true);
     setShowSetup(false);
     if(ph){
-      // Save original immediately so it persists
       setProfPhoto(ph);
-      localSave("profPhoto",ph);
-      // Then compress and sync to Firebase in background
+      idbSave("profPhoto",ph);
       try {
         const compressed=await compressImage(ph,300,0.4);
         setProfPhoto(compressed);
-        localSave("profPhoto",compressed);
+        idbSave("profPhoto",compressed);
         syncProfile(compressed);
       } catch(e) { syncProfile(ph); }
     }
@@ -482,8 +505,14 @@ function App(){
     const f=e.target.files?.[0];if(!f)return;
     const reader=new FileReader();
     reader.onload=async(ev)=>{
-      const compressed=await compressImage(ev.target.result,400,0.5);
-      setProfPhoto(compressed);syncProfile(compressed);
+      setProfPhoto(ev.target.result);
+      idbSave("profPhoto",ev.target.result);
+      try {
+        const compressed=await compressImage(ev.target.result,300,0.4);
+        setProfPhoto(compressed);
+        idbSave("profPhoto",compressed);
+        syncProfile(compressed);
+      } catch(e) { syncProfile(ev.target.result); }
     };
     reader.readAsDataURL(f);e.target.value="";
   }
